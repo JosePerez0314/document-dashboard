@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { RowDataPacket } from "mysql2/promise";
 import pool from "@/lib/db";
+import jwt from "jsonwebtoken";
+import { cookies } from "next/headers";
 
 type UserRole = "ADMIN" | "REVISOR";
 
@@ -64,6 +66,29 @@ export async function POST(req: NextRequest) {
     }
 
     const user = rows[0];
+
+    // JWT
+    const secret = process.env.JWT_SECRET;
+
+    if (!secret)
+      throw new Error("FATAL: JWT_SECRET environment variable is missing");
+
+    const token = jwt.sign(
+      {
+        id: user.id,
+        role: user.role,
+      },
+      secret,
+      { expiresIn: "8h" },
+    );
+
+    const cookieStore = await cookies();
+    cookieStore.set("auth_token", token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "strict",
+      maxAge: 60 * 60 * 8,
+    });
 
     return NextResponse.json(
       {

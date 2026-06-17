@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { RowDataPacket, ResultSetHeader } from "mysql2/promise";
 import pool from "@/lib/db";
+import { getUserId } from "@/lib/auth";
 
 interface Expediente extends RowDataPacket {
   id: string;
@@ -28,16 +29,16 @@ interface CreateExpedienteBody {
  */
 export async function GET() {
   try {
-    const connection = await pool.getConnection();
+    const revisorId = await getUserId();
 
-    try {
-      const query = "SELECT * FROM expedientes ORDER BY created_at DESC";
-      const [rows] = await connection.query<Expediente[]>(query);
+    if (!revisorId)
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
-      return NextResponse.json(rows, { status: 200 });
-    } finally {
-      connection.release();
-    }
+    const query =
+      "SELECT * FROM expedientes WHERE revisor_id = ? ORDER BY created_at DESC";
+    const [rows] = await pool.query<Expediente[]>(query, [revisorId]);
+
+    return NextResponse.json(rows, { status: 200 });
   } catch (error) {
     console.error("GET /api/expedientes error:", error);
     return NextResponse.json(
@@ -54,6 +55,10 @@ export async function GET() {
  */
 export async function POST(request: NextRequest) {
   try {
+    const revisorId = await getUserId();
+    if (!revisorId)
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
     const body: CreateExpedienteBody = await request.json();
 
     // Validate required fields
@@ -71,51 +76,34 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Validate revisor_id if provided
-    if (body.revisor_id !== undefined && typeof body.revisor_id !== "number") {
+    const query =
+      "INSERT INTO expedientes (id, nombre, status, revisor_id) VALUES (?, ?, ?, ?)";
+    const values = [body.id, body.nombre, "PENDIENTE", revisorId || null];
+
+    await pool.query<ResultSetHeader>(query, values);
+
+    // Fetch and return the created expediente
+    const selectQuery =
+      "SELECT * FROM expedientes WHERE id = ? AND revisor_id = ?";
+    const [rows] = await pool.query<Expediente[]>(selectQuery, [
+      body.id,
+      revisorId,
+    ]);
+
+    if (rows.length === 0) {
       return NextResponse.json(
-        { error: "Invalid field type: revisor_id must be a number" },
-        { status: 400 },
+        { error: "Expediente not found" },
+        { status: 404 },
       );
     }
 
-    const connection = await pool.getConnection();
+    const createdExpediente = rows[0];
 
-    try {
-      const query =
-        "INSERT INTO expedientes (id, nombre, status, revisor_id) VALUES (?, ?, ?, ?)";
-      const values = [
-        body.id,
-        body.nombre,
-        "PENDIENTE",
-        body.revisor_id || null,
-      ];
-
-      await connection.query<ResultSetHeader>(query, values);
-
-      // Fetch and return the created expediente
-      const selectQuery = "SELECT * FROM expedientes WHERE id = ?";
-      const [rows] = await connection.query<Expediente[]>(selectQuery, [
-        body.id,
-      ]);
-
-      const createdExpediente = rows[0];
-
-      return NextResponse.json(createdExpediente, { status: 201 });
-    } finally {
-      connection.release();
-    }
+    return NextResponse.json(createdExpediente, { status: 201 });
   } catch (error: unknown) {
     console.error("POST /api/expedientes error:", error);
 
     // Check for duplicate entry error
-    if (error instanceof Error && error.message.includes("Duplicate entry")) {
-      return NextResponse.json(
-        { error: "Expediente with this id already exists" },
-        { status: 400 },
-      );
-    }
-
     return NextResponse.json(
       { error: "Failed to create expediente" },
       { status: 500 },
