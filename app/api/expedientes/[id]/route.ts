@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { RowDataPacket, ResultSetHeader } from "mysql2/promise";
 import pool from "@/lib/db";
+import { getUserId } from "@/lib/auth";
 
 interface Expediente extends RowDataPacket {
   id: string;
@@ -25,7 +26,10 @@ interface UpdateExpedienteBody {
     | "CORREGIDO"
     | "CONFIRMADO";
   revisor_id?: number | null;
+  comentario?: string;
 }
+
+type StatusEnum = UpdateExpedienteBody["status"];
 
 interface RouteParams {
   id: string;
@@ -41,6 +45,10 @@ export async function GET(
 ) {
   try {
     const { id } = await params;
+    const revisorId = getUserId();
+
+    if (!revisorId)
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
     if (!id || typeof id !== "string") {
       return NextResponse.json(
@@ -49,23 +57,18 @@ export async function GET(
       );
     }
 
-    const connection = await pool.getConnection();
+    const query =
+      "SELECT * FROM expedientes WHERE id = ? AND revisor_id = ?  LIMIT 1";
+    const [rows] = await pool.query<Expediente[]>(query, [id, revisorId]);
 
-    try {
-      const query = "SELECT * FROM expedientes WHERE id = ?";
-      const [rows] = await connection.query<Expediente[]>(query, [id]);
-
-      if (rows.length === 0) {
-        return NextResponse.json(
-          { error: "Expediente not found" },
-          { status: 404 },
-        );
-      }
-
-      return NextResponse.json(rows[0], { status: 200 });
-    } finally {
-      connection.release();
+    if (rows.length === 0) {
+      return NextResponse.json(
+        { error: "Expediente not found" },
+        { status: 404 },
+      );
     }
+
+    return NextResponse.json(rows[0], { status: 200 });
   } catch (error) {
     console.error("GET /api/expedientes/[id] error:", error);
     return NextResponse.json(
@@ -86,6 +89,11 @@ export async function PUT(
 ) {
   try {
     const { id } = await params;
+
+    const revisorId = await getUserId();
+
+    if (!revisorId)
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
     if (!id || typeof id !== "string") {
       return NextResponse.json(
@@ -122,34 +130,29 @@ export async function PUT(
       );
     }
 
-    if (
-      body.revisor_id !== undefined &&
-      body.revisor_id !== null &&
-      typeof body.revisor_id !== "number"
-    ) {
-      return NextResponse.json(
-        {
-          error: "Invalid field type: revisor_id must be a number or null",
-        },
-        { status: 400 },
-      );
-    }
-
     const connection = await pool.getConnection();
 
     try {
+      await connection.beginTransaction();
+
       // Check if expediente exists
-      const checkQuery = "SELECT id FROM expedientes WHERE id = ?";
-      const [checkRows] = await connection.query<Expediente[]>(checkQuery, [
+      const checkQuery =
+        "SELECT id, status FROM expedientes WHERE id = ? AND revisor_id = ? LIMIT 1";
+      const [checkRows] = await connection.query<RowDataPacket[]>(checkQuery, [
         id,
+        revisorId,
       ]);
 
       if (checkRows.length === 0) {
+        await connection.rollback();
         return NextResponse.json(
           { error: "Expediente not found" },
           { status: 404 },
         );
       }
+
+      const previousStatus = checkRows[0].status as StatusEnum;
+      const newStatus: StatusEnum = body.status || previousStatus;
 
       // Build dynamic update query
       const updateFields: string[] = [];
@@ -165,22 +168,39 @@ export async function PUT(
         updateValues.push(body.status);
       }
 
-      if (body.revisor_id !== undefined) {
-        updateFields.push("revisor_id = ?");
-        updateValues.push(body.revisor_id);
+      if (updateFields.length > 0) {
+        const updateQuery = `UPDATE expedientes SET ${updateFields.join(", ")} WHERE id = ?`;
+
+        updateValues.push(id);
+
+        await connection.query<ResultSetHeader>(updateQuery, updateValues);
       }
 
-      updateFields.push("updated_at = CURRENT_TIMESTAMP");
-      updateValues.push(id);
-
-      const updateQuery = `UPDATE expedientes SET ${updateFields.join(", ")} WHERE id = ?`;
-      await connection.query<ResultSetHeader>(updateQuery, updateValues);
-
       // Fetch updated expediente
-      const selectQuery = "SELECT * FROM expedientes WHERE id = ?";
-      const [updatedRows] = await connection.query<Expediente[]>(selectQuery, [
+      const logsQuery = `
+        INSERT INTO expediente_logs 
+        (expediente_id, author_id, previous_status, new_status, comentario) 
+        VALUES (?, ?, ?, ?, ?)
+      `;
+
+      const logsValues = [
         id,
-      ]);
+        revisorId,
+        previousStatus,
+        newStatus,
+        body.comentario || null, // If no comment is provided, send null
+      ];
+
+      await connection.query(logsQuery, logsValues);
+
+      await connection.commit();
+
+      const selectQuery =
+        "SELECT * FROM expedientes WHERE id = ? AND revisor_id = ? LIMIT 1";
+      const [updatedRows] = await connection.query<RowDataPacket[]>(
+        selectQuery,
+        [id, revisorId],
+      );
 
       return NextResponse.json(
         {
@@ -189,6 +209,9 @@ export async function PUT(
         },
         { status: 200 },
       );
+    } catch (transactionError) {
+      await connection.rollback();
+      throw transactionError;
     } finally {
       connection.release();
     }
@@ -227,33 +250,25 @@ export async function DELETE(
       );
     }
 
-    const connection = await pool.getConnection();
+    // Check if expediente exists
+    const checkQuery = "SELECT id FROM expedientes WHERE id = ?";
+    const [checkRows] = await pool.query<Expediente[]>(checkQuery, [id]);
 
-    try {
-      // Check if expediente exists
-      const checkQuery = "SELECT id FROM expedientes WHERE id = ?";
-      const [checkRows] = await connection.query<Expediente[]>(checkQuery, [
-        id,
-      ]);
-
-      if (checkRows.length === 0) {
-        return NextResponse.json(
-          { error: "Expediente not found" },
-          { status: 404 },
-        );
-      }
-
-      // Delete expediente (cascades to expediente_logs)
-      const deleteQuery = "DELETE FROM expedientes WHERE id = ?";
-      await connection.query<ResultSetHeader>(deleteQuery, [id]);
-
+    if (checkRows.length === 0) {
       return NextResponse.json(
-        { message: "Expediente deleted successfully" },
-        { status: 200 },
+        { error: "Expediente not found" },
+        { status: 404 },
       );
-    } finally {
-      connection.release();
     }
+
+    // Delete expediente (cascades to expediente_logs)
+    const deleteQuery = "DELETE FROM expedientes WHERE id = ?";
+    await pool.query<ResultSetHeader>(deleteQuery, [id]);
+
+    return NextResponse.json(
+      { message: "Expediente deleted successfully" },
+      { status: 200 },
+    );
   } catch (error) {
     console.error("DELETE /api/expedientes/[id] error:", error);
     return NextResponse.json(

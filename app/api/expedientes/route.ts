@@ -4,7 +4,7 @@ import pool from "@/lib/db";
 import { getUserId } from "@/lib/auth";
 
 interface Expediente extends RowDataPacket {
-  id: string;
+  id: number;
   nombre: string;
   status:
     | "PENDIENTE"
@@ -18,9 +18,10 @@ interface Expediente extends RowDataPacket {
 }
 
 interface CreateExpedienteBody {
-  id: string;
+  id: number;
   nombre: string;
   revisor_id: number;
+  comentario?: string;
 }
 
 /**
@@ -54,20 +55,17 @@ export async function GET() {
  * Body: { id: string, nombre: string, revisor_id?: number }
  */
 export async function POST(request: NextRequest) {
+  const connection = await pool.getConnection();
+
   try {
+    // 1. Authenticate the User
     const revisorId = await getUserId();
-    if (!revisorId)
+    if (!revisorId) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-
-    const body: CreateExpedienteBody = await request.json();
-
-    // Validate required fields
-    if (!body.id || typeof body.id !== "string") {
-      return NextResponse.json(
-        { error: "Missing or invalid required field: id" },
-        { status: 400 },
-      );
     }
+
+    // 2. Parse and Validate Request Payload
+    const body: CreateExpedienteBody = await request.json();
 
     if (!body.nombre || typeof body.nombre !== "string") {
       return NextResponse.json(
@@ -76,37 +74,86 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const query =
-      "INSERT INTO expedientes (id, nombre, status, revisor_id) VALUES (?, ?, ?, ?)";
-    const values = [body.id, body.nombre, "PENDIENTE", revisorId || null];
+    if (body.comentario && typeof body.comentario !== "string") {
+      return NextResponse.json(
+        { error: "Invalid field type: comentario must be a string" },
+        { status: 400 },
+      );
+    }
 
-    await pool.query<ResultSetHeader>(query, values);
+    // 3. START THE TRANSACTION LAYER
+    await connection.beginTransaction();
 
-    // Fetch and return the created expediente
-    const selectQuery =
-      "SELECT * FROM expedientes WHERE id = ? AND revisor_id = ?";
-    const [rows] = await pool.query<Expediente[]>(selectQuery, [
-      body.id,
+    // 4. Action 1: Insert into 'expedientes'
+    const insertQuery =
+      "INSERT INTO expedientes (nombre, status, revisor_id) VALUES (?, ?, ?)";
+    const insertValues = [body.nombre, "PENDIENTE", revisorId];
+
+    const [insertResult] = await connection.query<ResultSetHeader>(
+      insertQuery,
+      insertValues,
+    );
+
+    const newExpedienteId = insertResult.insertId;
+
+    // 5. Action 2: Insert Initial Append-Only Audit Log
+    const logsQuery = `
+      INSERT INTO expediente_logs 
+      (expediente_id, author_id, previous_status, new_status, comentario) 
+      VALUES (?, ?, ?, ?, ?)
+    `;
+
+    const logsValues = [
+      newExpedienteId,
       revisorId,
+      null, // previous_status is null because it didn't exist before
+      "PENDIENTE", // new_status
+      body.comentario || "Registro inicial del expediente", // Fixed the missing parameter
+    ];
+
+    // FIXED: Executing the statement securely on the same connection
+    await connection.query(logsQuery, logsValues);
+
+    // 6. THE ATOMIC COMMIT: Lock changes permanently to disk
+    await connection.commit();
+
+    // 7. Fetch the created record to build the complete application state
+    const selectQuery = "SELECT * FROM expedientes WHERE id = ? LIMIT 1";
+    const [rows] = await connection.query<RowDataPacket[]>(selectQuery, [
+      newExpedienteId,
     ]);
 
     if (rows.length === 0) {
       return NextResponse.json(
-        { error: "Expediente not found" },
-        { status: 404 },
+        { error: "Failed to confirm created record state" },
+        { status: 500 },
       );
     }
 
     const createdExpediente = rows[0];
 
-    return NextResponse.json(createdExpediente, { status: 201 });
+    // 8. Generate the Presentation-Layer Serialized ID string on-the-fly
+    const displayId = `EXP-${String(createdExpediente.id).padStart(4, "0")}`;
+
+    // Return the response combining raw storage state with formatted client-facing data
+    return NextResponse.json(
+      {
+        ...createdExpediente,
+        display_id: displayId,
+      },
+      { status: 201 },
+    );
   } catch (error: unknown) {
+    // THE SAFETY NET: Wipe the creation out of memory if anything failed mid-flight
+    await connection.rollback();
     console.error("POST /api/expedientes error:", error);
 
-    // Check for duplicate entry error
     return NextResponse.json(
-      { error: "Failed to create expediente" },
+      { error: "Failed to create expediente and log entry" },
       { status: 500 },
     );
+  } finally {
+    // Return connection wire back to the pool
+    connection.release();
   }
 }
