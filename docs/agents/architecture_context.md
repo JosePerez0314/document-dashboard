@@ -23,6 +23,12 @@ The goal is to automate the manual administrative work of an Archive Manager.
 - `/db/migrations`: Contains sequential SQL files for schema changes.
 - `/lib`: Contains shared utilities, database connections (`db.ts`), and authentication (`auth.ts`).
 
+## Scope Lock: Backend
+
+The backend (`/app/api`, `/lib/db.ts`, `/lib/auth.ts`, `/db/migrations`) is COMPLETE for V1 and FROZEN.
+Do not modify, refactor, or "improve" backend files unless the task explicitly says "backend" and names the file.
+If a frontend task seems to require a backend change, STOP and report this instead of making the change yourself.
+
 ## Feature Roadmap & State Management
 
 ### Version 1: Workflow Automation (Current Focus)
@@ -48,3 +54,17 @@ We strictly follow **GitHub Flow**.
 ## Engineering Philosophy
 
 Prioritize execution, system thinking, and long-term maintainability. Solutions must be scalable, heavily typed, and strictly follow the established directory structure. Do not build features outside of the stated V1 and V2 scopes.
+
+## Confirmation Protocol (Required Before Any Commit)
+
+Before committing any change, state the following back to the user in plain text — do not skip this even if the task seems trivial:
+
+1. **Scope check:** "This change touches: [files]. This is [frontend-only / backend-only / both]."
+   - If it touches backend and the task didn't ask for backend: STOP, do not proceed, ask first.
+2. **Domain check:** "This change does [not] introduce digital file storage (uploads, PDFs, images)."
+   - If it does introduce file storage: STOP. This system tracks physical paper only. Ask before proceeding.
+3. **Version check:** "This change belongs to [V1 / V2]."
+   - If V2 (chain-of-custody state tracking) and V1 is not yet shipped: flag it, ask whether to proceed anyway.
+4. **Commit message:** show the exact Conventional Commits message before running `git commit`, not after.
+
+If any check fails, do not auto-correct silently — surface the conflict and wait for explicit confirmation.
